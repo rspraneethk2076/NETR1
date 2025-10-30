@@ -10,7 +10,7 @@ laptop_cam_index = 0                           # default webcam index
 # Initialize both cameras
 # --------------------------
 phone_cap = cv2.VideoCapture(phone_url)
-laptop_cap = cv2.VideoCapture(laptop_cam_index)
+laptop_cap = cv2.VideoCapture(laptop_cam_index)      #Initialize video capture objects for phone and laptop camera inputs
 
 if not phone_cap.isOpened():
     print("❌ Could not open phone camera stream.")
