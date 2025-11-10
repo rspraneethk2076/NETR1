@@ -1,63 +1,81 @@
 import cv2
+from ultralytics import YOLO
+import time
+import torch
 
-# --------------------------
-# Configuration
-# --------------------------
-phone_url = "http://192.168.1.97:8080/video"   # your phone IP Webcam stream
-laptop_cam_index = 0                           # default webcam index
+# ========================= CONFIG =========================
+MODEL_PATH = "best.pt"          # your trained weights
+CONF_THRESH = 0.5               # confidence threshold
+CLASSES = ["bendover", "jump", "lying", "run", "sit", "squat", "stand", "stretch", "walk"]
 
-# --------------------------
-# Initialize both cameras
-# --------------------------
-phone_cap = cv2.VideoCapture(phone_url)
-laptop_cap = cv2.VideoCapture(laptop_cam_index)      #Initialize video capture objects for phone and laptop camera inputs
+# Auto-select device
+DEVICE = "0" if torch.cuda.is_available() else "cpu"
+print(f"🔧 Using device: {DEVICE}")
 
-if not phone_cap.isOpened():
-    print("❌ Could not open phone camera stream.")
-if not laptop_cap.isOpened():
-    print("❌ Could not open laptop camera.")
+# ==========================================================
+def main():
+    print("🚀 Loading YOLOv11 model...")
+    model = YOLO(MODEL_PATH)
+    print("✅ Model loaded successfully!")
+    
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Could not open webcam.")
+        return
+    
+    print("🎥 Live pose detection started — press 'q' to quit.\n")
 
-# Reduce buffering and tune FPS for phone
-phone_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-phone_cap.set(cv2.CAP_PROP_FPS, 30)
+    fps_time = time.time()
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Run YOLO inference
+        results = model.predict(frame, conf=CONF_THRESH, device=DEVICE, verbose=False)
+        
+        annotated = frame.copy()
+        for r in results:
+            boxes = r.boxes.xyxy
+            cls_ids = r.boxes.cls
+            confs = r.boxes.conf
 
-# Optional: set resolution for laptop cam
-laptop_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-laptop_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            for i in range(len(boxes)):
+                x1, y1, x2, y2 = map(int, boxes[i])
+                cls_id = int(cls_ids[i])
+                conf = float(confs[i])
+                if cls_id < 0 or cls_id >= len(CLASSES):
+                    continue
 
-# --------------------------
-# Create resizable windows
-# --------------------------
-cv2.namedWindow("Laptop Camera", cv2.WINDOW_NORMAL)
-cv2.namedWindow("Phone Camera", cv2.WINDOW_NORMAL)
+                label = f"{CLASSES[cls_id]} ({conf:.2f})"
+                
+                # Draw bounding box
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-# Initial window sizes (can drag to resize freely)
-cv2.resizeWindow("Laptop Camera", 640, 480)
-cv2.resizeWindow("Phone Camera", 800, 600)
+                # Label at bottom of box
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                y_label = y2 + th + 6 if y2 + th + 6 < annotated.shape[0] else y2 - 10
+                cv2.rectangle(annotated, (x1, y_label - th - 6), (x1 + tw + 6, y_label), (0, 255, 0), -1)
+                cv2.putText(annotated, label, (x1 + 3, y_label - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
-# --------------------------
-# Main loop
-# --------------------------
-while True:
-    ok_lap, laptop_frame = laptop_cap.read()
-    ok_phone, phone_frame = phone_cap.read()
+        # FPS overlay
+        fps = 1.0 / (time.time() - fps_time)
+        fps_time = time.time()
+        cv2.putText(annotated, f"FPS: {fps:.1f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        
+        cv2.imshow("POLAR YOLOv11 - Live Pose Detection", annotated)
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    print("✅ Stream ended.")
 
-    # Resize each frame programmatically (optional)
-    if ok_lap:
-        laptop_frame = cv2.resize(laptop_frame, (640, 480))
-        cv2.imshow("Laptop Camera", laptop_frame)
 
-    if ok_phone:
-        phone_frame = cv2.resize(phone_frame, (800, 600))
-        cv2.imshow("Phone Camera", phone_frame)
-
-    # Quit both feeds with 'q'
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-# --------------------------
-# Cleanup
-# --------------------------
-laptop_cap.release()
-phone_cap.release()
-cv2.destroyAllWindows()
+# ==========================================================
+if __name__ == "__main__":
+    main()
