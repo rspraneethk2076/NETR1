@@ -1,81 +1,87 @@
-import cv2
-from ultralytics import YOLO
+# frame_processor.py
 import time
-import torch
+from datetime import datetime
 
-# ========================= CONFIG =========================
-MODEL_PATH = "best.pt"          # your trained weights
-CONF_THRESH = 0.5               # confidence threshold
-CLASSES = ["bendover", "jump", "lying", "run", "sit", "squat", "stand", "stretch", "walk"]
-
-# Auto-select device
-DEVICE = "0" if torch.cuda.is_available() else "cpu"
-print(f"🔧 Using device: {DEVICE}")
-
-# ==========================================================
-def main():
-    print("🚀 Loading YOLOv11 model...")
-    model = YOLO(MODEL_PATH)
-    print("✅ Model loaded successfully!")
-    
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("❌ Could not open webcam.")
-        return
-    
-    print("🎥 Live pose detection started — press 'q' to quit.\n")
-
-    fps_time = time.time()
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # Run YOLO inference
-        results = model.predict(frame, conf=CONF_THRESH, device=DEVICE, verbose=False)
-        
-        annotated = frame.copy()
-        for r in results:
-            boxes = r.boxes.xyxy
-            cls_ids = r.boxes.cls
-            confs = r.boxes.conf
-
-            for i in range(len(boxes)):
-                x1, y1, x2, y2 = map(int, boxes[i])
-                cls_id = int(cls_ids[i])
-                conf = float(confs[i])
-                if cls_id < 0 or cls_id >= len(CLASSES):
-                    continue
-
-                label = f"{CLASSES[cls_id]} ({conf:.2f})"
-                
-                # Draw bounding box
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                # Label at bottom of box
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                y_label = y2 + th + 6 if y2 + th + 6 < annotated.shape[0] else y2 - 10
-                cv2.rectangle(annotated, (x1, y_label - th - 6), (x1 + tw + 6, y_label), (0, 255, 0), -1)
-                cv2.putText(annotated, label, (x1 + 3, y_label - 3),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-
-        # FPS overlay
-        fps = 1.0 / (time.time() - fps_time)
-        fps_time = time.time()
-        cv2.putText(annotated, f"FPS: {fps:.1f}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        
-        cv2.imshow("POLAR YOLOv11 - Live Pose Detection", annotated)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-    
-    cap.release()
-    cv2.destroyAllWindows()
-    print("✅ Stream ended.")
+import state
+from llm_utils import llava_scene_description, llama_generate_object_action_json
+from face_utils import get_face_embedding, identify_person
+from video_utils import detect_changes
+from graph_utils import update_scene_graph, save_scene_graph_image
+from logging_utils import save_json_log
 
 
-# ==========================================================
-if __name__ == "__main__":
-    main()
+class FrameProcessor:
+    """
+    Processes frames at a fixed interval (e.g., every 3s).
+    Called from a background worker (NOT directly in the video callback).
+    """
+
+    def __init__(self, interval: float = 3.0):
+        self.interval = interval
+        self.last_time = 0.0
+        self.previous_frame = None
+        self.previous_face_emb = None
+
+    def process(self, frame_bgr):
+        """
+        frame_bgr: numpy array (H, W, 3) in BGR format
+        """
+        now = time.time()
+        if now - self.last_time < self.interval:
+            # Too soon since last processing; skip this frame
+            return
+        self.last_time = now
+
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
+        # 1) LLaVA description
+        description_text = llava_scene_description(frame_bgr)
+
+        # 2) LLaMA structured object-actions JSON
+        object_actions = llama_generate_object_action_json(description_text)
+
+        # 3) Face embedding + person ID
+        face_emb = get_face_embedding(frame_bgr)
+        person_id = identify_person(face_emb)
+
+        # 4) Change detection
+        change_info = detect_changes(
+            frame_bgr,
+            self.previous_frame,
+            face_emb,
+            self.previous_face_emb,
+        )
+
+        # 5) Extract flat lists
+        objects = [oa.get("object") for oa in object_actions]
+        actions = [oa.get("association") for oa in object_actions]
+
+        # Update previous frame & embedding
+        self.previous_frame = frame_bgr.copy()
+        self.previous_face_emb = face_emb
+
+        # 6) Build log entry
+        entry = {
+            "timestamp": timestamp,
+            "person_id": person_id,
+            "object_actions": object_actions,
+            "objects": objects,
+            "actions": actions,
+            "description": description_text,
+            "changes": change_info,
+        }
+
+        # 7) Update in-memory log + scene graph (thread-safe)
+        with state.lock:
+            state.memory.append(entry)
+            update_scene_graph(person_id, object_actions, timestamp)
+            save_scene_graph_image(person_id, timestamp)
+
+        # 8) Persist JSON log
+        save_json_log(entry)
+
+        # Debug in server logs
+        print(f"\n📝 FRAME @ {timestamp}")
+        print("Raw Description:", description_text)
+        print("Generated JSON:", object_actions)
+        print("Changes:", change_info)
